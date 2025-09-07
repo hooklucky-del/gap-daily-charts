@@ -1,7 +1,7 @@
 name: gap-auto-update
 on:
   schedule:
-    - cron: '30 10 * * *'   # 每天 18:30 CST（GitHub 用 UTC）
+    - cron: '30 10 * * *'   # 每天 UTC 10:30 ≈ 北京时间 18:30
   workflow_dispatch:
 
 permissions:
@@ -21,9 +21,237 @@ jobs:
         run: |
           pip install -q yfinance pandas matplotlib numpy statsmodels akshare lxml
 
+      - name: Ensure data dir
+        run: |
+          mkdir -p data
+
+      - name: Write updater (CI-only)
+        shell: bash
+        run: |
+          cat > updater_ci.py << 'PY'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          import sys, warnings, time
+          from datetime import datetime
+          from pathlib import Path
+          import numpy as np
+          import pandas as pd
+          import matplotlib.pyplot as plt
+
+          warnings.filterwarnings("ignore", category=FutureWarning)
+          plt.rcParams['axes.unicode_minus'] = False
+          plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+          plt.rcParams['svg.fonttype'] = 'path'
+          plt.rcParams['pdf.fonttype'] = 42
+
+          def try_import(name):
+              try:
+                  return __import__(name)
+              except Exception:
+                  return None
+
+          yf = try_import("yfinance")
+          ak = try_import("akshare")
+
+          def to_monthly_last(s: pd.Series) -> pd.Series:
+              if s is None or s.empty:
+                  return s
+              g = s.groupby(s.index.to_period('M')).last()
+              g.index = g.index.to_timestamp('M')
+              return g
+
+          def read_policy_dr007(csv_path: Path, start='2014-01-01') -> pd.DataFrame:
+              if not csv_path.exists():
+                  raise FileNotFoundError(f"CSV not found: {csv_path}")
+              for enc in ['utf-8-sig','utf-8','gbk','gb2312']:
+                  try:
+                      df = pd.read_csv(csv_path, encoding=enc)
+                      break
+                  except Exception:
+                      continue
+              if df.shape[0] == 0:
+                  raise ValueError("政策利率/DR007 CSV 为空")
+              date_col = df.columns[0]
+              df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+              df = df.dropna(subset=[date_col]).sort_values(by=date_col).set_index(date_col)
+              # 用“当月截至当日的最新值”（月末口径）
+              rng = pd.date_range(start=start, end=datetime.today(), freq='M')
+              out = pd.DataFrame(index=rng)
+              if '政策利率' not in df.columns or 'DR007' not in df.columns:
+                  raise ValueError("CSV 需要包含列：政策利率、DR007")
+              pol = pd.to_numeric(df['政策利率'], errors='coerce').resample('D').ffill().groupby(lambda x: x.to_period('M')).last()
+              dr  = pd.to_numeric(df['DR007'],   errors='coerce').resample('D').ffill().groupby(lambda x: x.to_period('M')).last()
+              pol.index = pol.index.to_timestamp('M')
+              dr.index  = dr.index.to_timestamp('M')
+              out['policy'] = pol
+              out['dr007']  = dr
+              return out
+
+          def fetch_index_monthly_robust(start='2014-01-01') -> pd.DataFrame:
+              def from_close(close: pd.Series):
+                  mclose = to_monthly_last(close).dropna()
+                  mret   = mclose.pct_change()
+                  level  = (1 + mret.fillna(0)).cumprod() * 100.0
+                  return pd.concat([mclose.rename('close_m'),
+                                    mret.rename('ret_m'),
+                                    level.rename('level_base100')], axis=1)
+
+              # 1) yfinance 399006.SZ
+              if yf is not None:
+                  try:
+                      data = yf.download("399006.SZ", start=start, progress=False, auto_adjust=True, threads=False)
+                      if data is not None and not data.empty and 'Close' in data:
+                          print("[info] index via yfinance (399006.SZ)")
+                          return from_close(data['Close'])
+                  except Exception as e:
+                      print(f"[warn] yfinance 399006.SZ failed: {e}")
+
+              # 2) AkShare 指数 399006
+              if ak is not None and hasattr(ak, "index_zh_a_hist"):
+                  try:
+                      tmp = ak.index_zh_a_hist(symbol="399006", period="daily",
+                                               start_date=start.replace('-', ''),
+                                               end_date=datetime.today().strftime("%Y%m%d"),
+                                               adjust="")
+                      dcol = next((c for c in tmp.columns if '日期' in c or 'date' in str(c).lower()), None)
+                      ccol = next((c for c in tmp.columns if '收盘' in c or 'close' in str(c).lower()), None)
+                      tmp[dcol] = pd.to_datetime(tmp[dcol], errors='coerce')
+                      tmp = tmp.dropna(subset=[dcol]).set_index(dcol).sort_index()
+                      close = pd.to_numeric(tmp[ccol], errors='coerce').dropna()
+                      if not close.empty:
+                          print("[info] index via akshare index_zh_a_hist (399006)")
+                          return from_close(close)
+                  except Exception as e:
+                      print(f"[warn] akshare 399006 failed: {e}")
+
+              # 3) yfinance 159915.SZ
+              if yf is not None:
+                  try:
+                      data = yf.download("159915.SZ", start=start, progress=False, auto_adjust=True, threads=False)
+                      if data is not None and not data.empty and 'Close' in data:
+                          print("[info] index via yfinance (159915.SZ proxy)")
+                          return from_close(data['Close'])
+                  except Exception as e:
+                      print(f"[warn] yfinance 159915.SZ failed: {e}")
+
+              # 4) AkShare ETF 159915
+              if ak is not None and hasattr(ak, "fund_etf_hist_em"):
+                  try:
+                      tmp = ak.fund_etf_hist_em(symbol="159915", period="daily",
+                                                start_date=start.replace('-', ''),
+                                                end_date=datetime.today().strftime("%Y%m%d"))
+                      dcol = next((c for c in tmp.columns if '日期' in c or 'date' in str(c).lower()), None)
+                      ccol = next((c for c in tmp.columns if '收盘' in c or 'close' in str(c).lower()), None)
+                      tmp[dcol] = pd.to_datetime(tmp[dcol], errors='coerce')
+                      tmp = tmp.dropna(subset=[dcol]).set_index(dcol).sort_index()
+                      close = pd.to_numeric(tmp[ccol], errors='coerce').dropna()
+                      if not close.empty:
+                          print("[info] index via akshare fund_etf_hist_em (159915 proxy)")
+                          return from_close(close)
+                  except Exception as e:
+                      print(f"[warn] akshare ETF 159915 failed: {e}")
+
+              raise RuntimeError("指数获取失败：yfinance 与 AkShare 均不可用")
+
+          def zscore(x: pd.Series) -> pd.Series:
+              x = x.astype(float)
+              return (x - x.mean()) / x.std(ddof=1)
+
+          def fwd_cum_simple(r: pd.Series, k: int) -> pd.Series:
+              rv = r.values
+              out = np.full_like(rv, np.nan, dtype=float)
+              for i in range(len(rv)-k):
+                  w = rv[i+1:i+1+k]
+                  out[i] = np.nan if np.any(np.isnan(w)) else np.prod(1+w)-1.0
+              return pd.Series(out, index=r.index)
+
+          def make_core_charts(panel: pd.DataFrame, out_dir: Path):
+              if panel.empty:
+                  raise ValueError("panel 为空：请检查数据是否有交集")
+              out_dir.mkdir(parents=True, exist_ok=True)
+              fig = plt.figure(figsize=(12,5), dpi=150); ax = plt.gca()
+              ax.plot(panel.index, zscore(panel['gap']), label='Gap Z', linewidth=2.0, color='#F59E0B')
+              ax.plot(panel.index, zscore(panel['level_base100']), label='ChiNext Z', linewidth=2.0, color='#EF4444')
+              ax.plot(panel.index, zscore(panel['gap'].rolling(12).mean()), label='Gap MA12 Z', linewidth=2.4, color='#1D4ED8')
+              title = f"Gap vs ChiNext (Z) + Gap MA12 | {panel.index.min():%Y-%m}–{panel.index.max():%Y-%m}"
+              ax.set_title(title)
+              ax.set_ylabel('Z-score'); ax.set_xlabel('Date')
+              ax.grid(True, linestyle='--', linewidth=0.6, alpha=0.5); ax.legend()
+              for ext in ['png','svg','pdf']:
+                  fig.savefig(out_dir / f'gap_vs_chinext_with_ma12.{ext}', bbox_inches='tight')
+              plt.close(fig)
+
+              roll = panel['gap'].rolling(12).corr(panel['ret_m'])
+              fig2 = plt.figure(figsize=(12,5), dpi=150); ax2 = plt.gca()
+              ax2.plot(roll.index, roll, label='Rolling corr (12m)', color='#F59E0B')
+              ax2.axhline(0.0, linestyle='--', linewidth=1.0, color='#F59E0B', alpha=0.6, label='0 baseline')
+              ax2.set_title('12m Rolling Correlation: Gap vs ChiNext monthly return')
+              ax2.set_ylabel('Correlation (12m)'); ax2.set_xlabel('Date')
+              ax2.grid(True, linestyle='--', linewidth=0.6, alpha=0.5); ax2.legend()
+              for ext in ['png','svg','pdf']:
+                  fig2.savefig(out_dir / f'rolling_corr_12m.{ext}', bbox_inches='tight')
+              plt.close(fig2)
+
+          def make_factor_panel(panel: pd.DataFrame, out_dir: Path):
+              fig = plt.figure(figsize=(12,5), dpi=150); ax = plt.gca()
+              if 'margin_ratio' in panel:
+                  ax.plot(panel.index, zscore(panel['margin_ratio']), label='Margin share (Z)', linewidth=2.0)
+              if 'pe_percentile' in panel:
+                  ax.plot(panel.index, -zscore(panel['pe_percentile']), label='-Valuation pct (Z)', linewidth=2.0)
+              if {'policy','dr007','gap'}.issubset(panel.columns):
+                  ax.plot(panel.index, zscore((panel['policy']-panel['dr007'])/panel['policy']), label='RelGap (Z)', linewidth=2.0)
+              ax.set_title('Factor panel (standardized)'); ax.set_ylabel('Z-score'); ax.set_xlabel('Date')
+              ax.grid(True, linestyle='--', linewidth=0.6, alpha=0.5); ax.legend()
+              for ext in ['png','svg','pdf']:
+                  fig.savefig(out_dir / f'factor_panel_standardized.{ext}', bbox_inches='tight')
+              plt.close(fig)
+
+          def make_corr_table(panel: pd.DataFrame, out_dir: Path):
+              rows = []
+              factors = [c for c in ['gap','rel_gap','ratio','margin_ratio','pe_percentile'] if c in panel.columns]
+              for f in factors:
+                  for k in [0,3,6,12]:
+                      if k==0:
+                          dfk = panel[[f,'ret_m']].dropna(); corr = dfk[f].corr(dfk['ret_m'])
+                      else:
+                          fwd = fwd_cum_simple(panel['ret_m'], k); dfk = pd.concat([panel[f], fwd], axis=1).dropna(); corr = dfk.iloc[:,0].corr(dfk.iloc[:,1])
+                      rows.append({'factor': f, 'k_months': k, 'corr': float(corr)})
+              pd.DataFrame(rows).pivot(index='factor', columns='k_months', values='corr').to_csv(out_dir / 'factor_corr_table.csv', encoding='utf-8-sig')
+
+          if __name__ == '__main__':
+              import argparse
+              ap = argparse.ArgumentParser()
+              ap.add_argument('--out', required=True)
+              ap.add_argument('--csv', required=True, help='data/中国 DR007 政策利率.csv')
+              ap.add_argument('--start', default='2014-01-01')
+              ap.add_argument('--margin-csv', default=None)
+              ap.add_argument('--pe-csv', default=None)
+              a = ap.parse_args()
+
+              out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+              policy_dr = read_policy_dr007(Path(a.csv), start=a.start)
+              index_m   = fetch_index_monthly_robust(start=a.start)
+
+              panel = policy_dr.join(index_m, how='inner')
+              if panel.empty:
+                  panel = policy_dr.join(index_m, how='outer').dropna(subset=['policy','dr007','ret_m','level_base100'])
+
+              panel['gap']      = panel['policy'] - panel['dr007']
+              panel['gap_ma12'] = panel['gap'].rolling(12).mean()
+              panel['rel_gap']  = panel['gap'] / panel['policy']
+              panel['ratio']    = panel['dr007'] / panel['policy']
+
+              panel.to_csv(out / 'gap_chinext_monthly_panel.csv', encoding='utf-8-sig')
+              make_core_charts(panel, out)
+              make_factor_panel(panel, out)
+              make_corr_table(panel, out)
+              print(f"[done] Updated through {panel.index.max():%Y-%m}. Files saved to: {out}")
+          PY
+          chmod +x updater_ci.py
+
       - name: Run updater
         run: |
-          python gap_auto_update.py --out out \
+          python updater_ci.py --out out \
             --csv "data/中国 DR007 政策利率.csv" \
             --margin-csv "data/两融成交占比.csv" \
             --pe-csv "data/全A估值.csv" \
@@ -47,7 +275,7 @@ jobs:
           git config user.name github-actions
           git config user.email actions@github.com
           mkdir -p charts
-          cp -r out/* charts/
-          git add charts/
+          cp -r out/* charts/ || true
+          git add charts/ || true
           git commit -m "daily charts ${{ github.run_id }}" || echo "no changes"
-          git push
+          git push || true
