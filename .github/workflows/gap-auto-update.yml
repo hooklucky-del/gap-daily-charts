@@ -54,17 +54,28 @@ jobs:
               g.index = g.index.to_timestamp('M')
               return g
 
-          def extend_to_current_month_locf(df: pd.DataFrame, cols=('policy','dr007')):
-              """若 df 只到上月，则把指定列用最后一个已知值临时展期到当月月末（provisional）。"""
-              if df.empty: return df, False
-              cur_m_end = pd.Timestamp(datetime.today()).to_period('M').to_timestamp('M')
-              last_idx = df.index.max()
-              if pd.isna(last_idx) or last_idx >= cur_m_end:
-                  return df, False
-              extended = df.copy()
-              extended.loc[cur_m_end, cols] = df[cols].iloc[-1].values
-              extended = extended.sort_index()
-              return extended, True
+          def def extend_to_current_month_locf(df: pd.DataFrame, cols=('policy','dr007')):
+    """若 df 只到上月，则把指定列用最后一个已知值临时展期到当月月末（provisional）。"""
+    if df is None or df.empty:
+        return df, False
+
+    # 防御：把传入的列名转为 list，并过滤不存在的列
+    cols_list = [*cols] if not isinstance(cols, list) else cols
+    cols_list = [c for c in cols_list if c in df.columns]
+    if len(cols_list) == 0:
+        print("[note] extend_to_current_month_locf: no target columns found; skipped")
+        return df, False
+
+    cur_m_end = pd.Timestamp(datetime.today()).to_period('M').to_timestamp('M')
+    last_idx = df.index.max()
+    if pd.isna(last_idx) or last_idx >= cur_m_end:
+        return df, False  # 已包含当月或索引异常
+
+    extended = df.copy()
+    # 用最后一行的现有列值展期到当月月底
+    extended.loc[cur_m_end, cols_list] = df[cols_list].iloc[-1].values
+    extended = extended.sort_index()
+    return extended, True
 
           # -------- 政策/DR007：在线优先，失败再用 CSV --------
           def fetch_policy_dr007_online(start='2014-01-01'):
