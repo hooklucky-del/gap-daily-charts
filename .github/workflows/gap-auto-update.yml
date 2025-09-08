@@ -1,7 +1,7 @@
 name: gap-auto-update
 on:
   schedule:
-    - cron: '30 10 * * *'   # 每天 UTC 10:30 ≈ 北京时间 18:30
+    - cron: '30 10 * * *'   # 每天 UTC 10:30 ≈ 北京时间/台北时间 18:30
   workflow_dispatch:
 
 permissions:
@@ -24,7 +24,7 @@ jobs:
       - name: Ensure data dir
         run: mkdir -p data
 
-      # 内嵌脚本（在线抓指数 + 政策/DR007；CSV 仅作回退；月频=当月最新值）
+      # === 内嵌脚本：在线抓指数 + 政策/DR007；CSV 仅作回退；月频=当月最新值；MA3 ===
       - name: Write updater (CI-only)
         shell: bash
         run: |
@@ -54,7 +54,19 @@ jobs:
               g.index = g.index.to_timestamp('M')
               return g
 
-          # 政策/DR007：在线优先，失败再用 CSV
+          def extend_to_current_month_locf(df: pd.DataFrame, cols=('policy','dr007')):
+              """若 df 只到上月，则把指定列用最后一个已知值临时展期到当月月末（provisional）。"""
+              if df.empty: return df, False
+              cur_m_end = pd.Timestamp(datetime.today()).to_period('M').to_timestamp('M')
+              last_idx = df.index.max()
+              if pd.isna(last_idx) or last_idx >= cur_m_end:
+                  return df, False
+              extended = df.copy()
+              extended.loc[cur_m_end, cols] = df[cols].iloc[-1].values
+              extended = extended.sort_index()
+              return extended, True
+
+          # -------- 政策/DR007：在线优先，失败再用 CSV --------
           def fetch_policy_dr007_online(start='2014-01-01'):
               if ak is None: raise RuntimeError("AkShare not installed")
               # DR007
@@ -128,7 +140,7 @@ jobs:
                       return read_policy_dr007_csv(csv_path, start=start)
                   raise
 
-          # 指数：yfinance 399006 → AkShare 399006 → yfinance 159915 → AkShare 159915（ETF 代理）
+          # -------- 指数：yfinance 399006 → AkShare 399006 → yfinance 159915 → AkShare 159915 --------
           def fetch_index_monthly(start='2014-01-01') -> pd.DataFrame:
               def from_close(close: pd.Series):
                   mclose = to_monthly_last(close).dropna()
@@ -195,7 +207,9 @@ jobs:
               raise RuntimeError("指数获取失败：yfinance 与 AkShare 均不可用")
 
           def zscore(x: pd.Series) -> pd.Series:
-              x = x.astype(float); return (x - x.mean()) / x.std(ddof=1)
+              x = x.astype(float); 
+              std = x.std(ddof=1)
+              return (x - x.mean()) / std if std and not np.isnan(std) else x*0
 
           def fwd_cum_simple(r: pd.Series, k: int) -> pd.Series:
               rv = r.values; out = np.full_like(rv, np.nan, dtype=float)
@@ -208,11 +222,12 @@ jobs:
               fig = plt.figure(figsize=(12,5), dpi=150); ax = plt.gca()
               ax.plot(panel.index, zscore(panel['gap']), label='Gap Z', linewidth=2.0, color='#F59E0B')
               ax.plot(panel.index, zscore(panel['level_base100']), label='ChiNext Z', linewidth=2.0, color='#EF4444')
-              ax.plot(panel.index, zscore(panel['gap'].rolling(12).mean()), label='Gap MA12 Z', linewidth=2.4, color='#1D4ED8')
-              ax.set_title(f"Gap vs ChiNext (Z) + Gap MA12 | {panel.index.min():%Y-%m}–{panel.index.max():%Y-%m}")
+              ax.plot(panel.index, zscore(panel['gap'].rolling(3).mean()), label='Gap MA3 Z', linewidth=2.4, color='#1D4ED8')
+              ax.set_title(f"Gap vs ChiNext (Z) + Gap MA3 | {panel.index.min():%Y-%m}–{panel.index.max():%Y-%m}")
               ax.set_ylabel('Z-score'); ax.set_xlabel('Date'); ax.grid(True, linestyle='--', linewidth=0.6, alpha=0.5); ax.legend()
-              for ext in ['png','svg','pdf']: fig.savefig(out_dir / f'gap_vs_chinext_with_ma12.{ext}', bbox_inches='tight')
+              for ext in ['png','svg','pdf']: fig.savefig(out_dir / f'gap_vs_chinext_with_ma3.{ext}', bbox_inches='tight')
               plt.close(fig)
+
               roll = panel['gap'].rolling(12).corr(panel['ret_m'])
               fig2 = plt.figure(figsize=(12,5), dpi=150); ax2 = plt.gca()
               ax2.plot(roll.index, roll, label='Rolling corr (12m)', color='#F59E0B')
@@ -255,20 +270,30 @@ jobs:
               a = ap.parse_args()
 
               out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+
+              # 政策/DR007：在线优先，失败才用 CSV；必要时临时展期到当月
               policy_dr = get_policy_dr007(start=a.start, csv_path=Path(a.csv))
+              policy_dr, provisional = extend_to_current_month_locf(policy_dr, cols=('policy','dr007'))
+              if provisional:
+                  print("[note] policy/dr007 for current month is provisional (LOCF from last month)")
+
+              # 指数：在线多源兜底
               index_m   = fetch_index_monthly(start=a.start)
 
+              # 合并
               panel = policy_dr.join(index_m, how='inner')
               if panel.empty:
                   panel = policy_dr.join(index_m, how='outer').dropna(subset=['policy','dr007','ret_m','level_base100'])
               if panel.empty:
                   raise ValueError("合并后为空：请检查数据日期交集")
 
+              # 指标（MA3）
               panel['gap']      = panel['policy'] - panel['dr007']
-              panel['gap_ma12'] = panel['gap'].rolling(12).mean()
+              panel['gap_ma3']  = panel['gap'].rolling(3).mean()
               panel['rel_gap']  = panel['gap'] / panel['policy']
               panel['ratio']    = panel['dr007'] / panel['policy']
 
+              # 导出 & 图
               panel.to_csv(out / 'gap_chinext_monthly_panel.csv', encoding='utf-8-sig')
               make_core_charts(panel, out)
               make_factor_panel(panel, out)
@@ -308,35 +333,32 @@ jobs:
           git commit -m "daily charts ${{ github.run_id }}" || echo "no changes"
           git push || true
 
-      # === 发送邮件（把关键图片直接发给你） ===
+      - name: Capture date (CN/TW)
+        id: date
+        run: echo "today=$(TZ=Asia/Shanghai date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+      # === 邮件发送（使用 SendGrid；若未配置 Secrets，此步不会阻塞） ===
       - name: Send email with charts
         uses: dawidd6/action-send-mail@v3
+        continue-on-error: true
         with:
-          server: smtp.gmail.com
+          server: smtp.sendgrid.net
           port: 465
           secure: true
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "Gap日报 | 更新至 ${{ steps.date.outputs.today }}"
+          username: ${{ secrets.SMTP_USERNAME }}   # = apikey
+          password: ${{ secrets.SMTP_PASSWORD }}   # = 你的 SendGrid API Key
+          subject: "Gap日报（MA3）| 更新至 ${{ steps.date.outputs.today }}"
           to: "hgwhgw275@gmail.com"
-          from: "Gap Bot <${{ secrets.SMTP_USERNAME }}>"
+          from: "Gap Bot <no-reply@your-domain.example>" # 用你在 SendGrid 验证过的发件邮箱
           body: |
-            <h3>Gap 日报（自动发送）</h3>
+            <h3>Gap 日报（MA3，自动发送）</h3>
             <p>已更新最新数据与图表，见附件：</p>
             <ul>
-              <li>gap_vs_chinext_with_ma12.png</li>
+              <li>gap_vs_chinext_with_ma3.png</li>
               <li>rolling_corr_12m.png</li>
             </ul>
             <p>仓库 charts/ 目录也已同步，artifact 名称：charts-and-data。</p>
           content_type: text/html
           attachments: |
-            out/gap_vs_chinext_with_ma12.png,
+            out/gap_vs_chinext_with_ma3.png,
             out/rolling_corr_12m.png
-        env:
-          # 生成一个今天日期（用于邮件标题）
-          TZ: Asia/Shanghai
-        continue-on-error: true
-
-      - name: Capture date (CN)
-        id: date
-        run: echo "today=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
