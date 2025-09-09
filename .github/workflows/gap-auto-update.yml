@@ -1,0 +1,48 @@
+name: gap-auto-update
+on:
+  schedule:
+    - cron: '30 10 * * *'   # 每天 UTC 10:30 ≈ 北京/台北 18:30
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps (pinned for stability)
+        run: |
+          pip install -q "yfinance==0.2.40" "akshare==1.16.90" pandas matplotlib numpy statsmodels lxml
+
+      - name: Ensure data dir
+        run: mkdir -p data
+
+      - name: Run updater_ci.py
+        env:
+          DEBUG_FETCH: "0"     # 调试时改为 "1" 打印端点/列名/样例
+        run: |
+          python updater_ci.py --out out --csv "data/中国 DR007 政策利率.csv" --start 2014-01-01
+
+      - name: Upload artifact (out)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: charts-and-data
+          path: out
+
+      - name: Commit charts back to repo
+        run: |
+          git config user.name github-actions
+          git config user.email actions@github.com
+          mkdir -p charts
+          cp -r out/* charts/ || true
+          git add charts/ || true
+          git commit -m "daily charts ${{ github.run_id }}" || echo "no changes"
+          git push || true
